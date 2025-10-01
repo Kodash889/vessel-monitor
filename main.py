@@ -15,7 +15,7 @@ import micropython
 from umqtt.simple import MQTTClient
 from automation import Automation2040WMini
 from network_manager import NetworkManager
-from ota_updater import OTAUpdater
+from ota import OTAUpdater
 import config  # Import the configuration file with all settings
 
 # Custom MAX6675 class from the previous working version.
@@ -30,12 +30,12 @@ class MAX6675:
         self.cs = machine.Pin(cs_pin, machine.Pin.OUT, value=1)
         self.so = machine.Pin(so_pin, machine.Pin.IN)
         self.sck.value(0)
-        
+
     def read(self):
         """Reads the raw 16-bit value from the MAX6675."""
         self.cs.value(0) # Select the chip
         time.sleep_us(10)
-        
+
         # Manually bit-bang the SPI communication
         raw_data = 0
         for i in range(16):
@@ -44,7 +44,7 @@ class MAX6675:
             if self.so.value():
                 raw_data |= 1
             self.sck.value(0)
-        
+
         self.cs.value(1) # Deselect the chip
         return raw_data
 
@@ -54,36 +54,22 @@ class MAX6675:
         Returns temperature or an error string if the circuit is open.
         """
         raw_val = self.read()
-        
+
         # Bit D2 is the OC (Open Circuit) bit
         if raw_val & 0b00000100:
             return "Error: Open Circuit"
-            
+
         # The first 12 bits are the temperature data
         temperature_bits = raw_val >> 3
-        
+
         # Convert to Celsius: each bit represents 0.25°C
         temp_celsius = temperature_bits * 0.25
-        
+
         if celsius:
             return temp_celsius
         else:
             return (temp_celsius * 9.0/5.0) + 32.0
 
-# --- OTA UPDATE CHECK ---
-# URL to your private GitHub repository
-OTA_URL = f'https://{config.OTA_TOKEN}@github.com/{config.OTA_REPO_OWNER}/{config.OTA_REPO_NAME}'
-firmware_path = 'src' # The path to your code within the repo release folder
-
-def check_for_ota_update():
-    """Check for and apply an OTA update if available."""
-    print("Checking for OTA updates...")
-    ota = OTAUpdater(OTA_URL, github_path=firmware_path)
-    try:
-        # Check if an update is available
-        ota.download_updates_if_available()
-    except Exception as e:
-        print(f"OTA update check failed: {e}")
 
 # --- 2. CONFIGURATION & GLOBALS ---
 # MQTT broker settings
@@ -92,8 +78,6 @@ MQTT_TOPIC_DATA = micropython.const(config.MQTT_TOPIC_DATA.format(config.MQTT_DE
 MQTT_TOPIC_STATUS = micropython.const(config.MQTT_TOPIC_STATUS.format(config.MQTT_DEVICE_NAME).encode('utf-8'))
 
 # Sensor pin definitions
-# The IN1 terminal is input 0 on the board.
-# The K-type thermocouple is connected to GP0, GP1 and GP2.
 THERMOCOUPLE_SCK_PIN = 0
 THERMOCOUPLE_CS_PIN = 1
 THERMOCOUPLE_SO_PIN = 2
@@ -116,12 +100,8 @@ thermocouple = MAX6675(
 def pulse_irq_handler(pin):
     """Interrupt handler to increment the pulse count."""
     global pulse_count
-    # The pin parameter is the Pin object that triggered the interrupt.
-    # It's a good practice to not do much in an ISR, just update a flag or counter.
     pulse_count += 1
 
-# Attach the interrupt handler to the RPM input pin (Input 0 on the board)
-# The `board.INPUTS[0]` provides the Pin object for the IN1 terminal.
 rpm_pin = machine.Pin(board.INPUTS[0].pin, machine.Pin.IN, machine.Pin.PULL_DOWN)
 rpm_pin.irq(trigger=machine.Pin.IRQ_RISING, handler=pulse_irq_handler)
 
@@ -136,7 +116,6 @@ def status_handler(mode, status, ip): # noqa: ARG001
         else:
             status_text = "Connection failed!"
             board.conn_led(False)
-
     print(status_text)
     print("IP: {}".format(ip))
 
@@ -149,7 +128,6 @@ def connect_mqtt():
         server=config.MQTT_BROKER
     )
     client.set_last_will(MQTT_TOPIC_STATUS, lwt_message.encode('utf-8'))
-    
     try:
         client.connect()
         print("Connected to MQTT broker.")
@@ -165,7 +143,20 @@ def connect_mqtt():
         board.switch_led(1, False)
         return None
 
-# --- 4. ASYNCHRONOUS TASKS ---
+# --- 4. OTA UPDATE CHECK ---
+def check_for_ota_update():
+    """Check for and apply an OTA update if available."""
+    print("Checking for OTA updates...")
+    try:
+        # Build the URL with the token
+        ota_url = "https://{0}@github.com/{1}/{2}".format(config.OTA_TOKEN, config.OTA_REPO_OWNER, config.OTA_REPO_NAME)
+        ota = OTAUpdater(ota_url, config.WIFI_SSID, config.WIFI_PASSWORD, main_dir="src")
+        # Check for updates and download if available
+        ota.download_and_install_update_if_available()
+    except Exception as e:
+        print(f"OTA update check failed: {e}")
+
+# --- 5. ASYNCHRONOUS TASKS ---
 async def publish_sensor_data(client):
     """Asynchronous task to read sensors and publish data."""
     global pulse_count
@@ -175,20 +166,14 @@ async def publish_sensor_data(client):
         try:
             current_time = utime.time()
             time_elapsed_seconds = current_time - last_publish_time
-
             if time_elapsed_seconds >= config.UPDATE_FREQUENCY_SECONDS:
-                # Calculate RPM
                 if time_elapsed_seconds > 0:
                     rpm = (pulse_count / pulses_per_revolution) / (time_elapsed_seconds / 60)
                 else:
                     rpm = 0
-
-                # Get Temperature data
                 temperature_celsius = thermocouple.read_temp()
                 if isinstance(temperature_celsius, (int, float)):
                     temperature_celsius += config.THERMOCOUPLE_CALIBRATION
-
-                # Prepare and Publish Data
                 if isinstance(temperature_celsius, (int, float)):
                     data_payload = {
                         "device": config.MQTT_DEVICE_NAME,
@@ -205,17 +190,13 @@ async def publish_sensor_data(client):
                         "error": temperature_celsius
                     }
                     client.publish(MQTT_TOPIC_DATA, json.dumps(error_payload))
-                
-                # Reset for next interval
                 micropython.schedule(lambda: setattr(globals(), 'pulse_count', 0), None)
                 last_publish_time = current_time
-
-            await uasyncio.sleep_ms(100) # Yield control to other tasks
-            
+            await uasyncio.sleep_ms(100)
         except OSError as e:
             print(f"MQTT publish error: {e}. Trying to reconnect...")
             board.switch_led(1, False)
-            return # Exit this task, main loop will handle reconnection
+            return
         except Exception as e:
             print(f"An error occurred in publish_sensor_data: {e}")
             await uasyncio.sleep(1)
@@ -240,9 +221,7 @@ async def main_async():
     """Main asynchronous loop for the application."""
     print("Starting Wi-Fi connection process...")
     network_manager = NetworkManager(config.COUNTRY, status_handler=status_handler)
-    
     try:
-        # Connect Wi-Fi and wait for a connection
         await network_manager.client(config.WIFI_SSID, config.WIFI_PASSWORD)
     except Exception as e:
         print(f"Failed to start network manager: {e}")
@@ -251,29 +230,21 @@ async def main_async():
     while True:
         mqtt_client = connect_mqtt()
         if mqtt_client:
-            # Create and run the main tasks
             print("Starting sensor monitor and publishing to MQTT...")
             print(f"Data topic: {MQTT_TOPIC_DATA.decode('utf-8')}")
             print(f"Status topic: {MQTT_TOPIC_STATUS.decode('utf-8')}")
-            
-            # Publish initial "connected" heartbeat
             heartbeat_message = json.dumps({"status": "connected"})
             mqtt_client.publish(MQTT_TOPIC_STATUS, heartbeat_message.encode('utf-8'))
-
-            # Start the asynchronous tasks
             uasyncio.create_task(publish_sensor_data(mqtt_client))
             uasyncio.create_task(publish_heartbeat(mqtt_client))
-
-            # Keep the main loop running, letting the tasks handle everything
             while True:
                 await uasyncio.sleep(1)
-
         else:
             print("Cannot proceed without an MQTT connection. Retrying in 5 seconds.")
             await uasyncio.sleep(5)
 
 if __name__ == "__main__":
-    check_for_ota_update() # Add OTA check here
+    check_for_ota_update()
     try:
         uasyncio.run(main_async())
     except KeyboardInterrupt:
