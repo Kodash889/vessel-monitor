@@ -23,7 +23,7 @@ import config  # Import the configuration file with all settings
 class MAX6675:
     """
     Driver for the MAX6675 thermocouple amplifier.
-    This class uses a bit-banging approach for SPI communication.
+    This class uses a bit-anging approach for SPI communication.
     """
     def __init__(self, sck_pin, cs_pin, so_pin):
         self.sck = machine.Pin(sck_pin, machine.Pin.OUT)
@@ -102,7 +102,8 @@ def pulse_irq_handler(pin):
     global pulse_count
     pulse_count += 1
 
-rpm_pin = machine.Pin(board.INPUTS[0].pin, machine.Pin.IN, machine.Pin.PULL_DOWN)
+# Correctly get the pin object for IN1 (GP26)
+rpm_pin = machine.Pin(26, machine.Pin.IN, machine.Pin.PULL_DOWN)
 rpm_pin.irq(trigger=machine.Pin.IRQ_RISING, handler=pulse_irq_handler)
 
 def status_handler(mode, status, ip): # noqa: ARG001
@@ -150,7 +151,11 @@ def check_for_ota_update():
     try:
         # Build the URL with the token
         ota_url = "https://{0}@github.com/{1}/{2}".format(config.OTA_TOKEN, config.OTA_REPO_OWNER, config.OTA_REPO_NAME)
-        ota = OTAUpdater(ota_url, config.WIFI_SSID, config.WIFI_PASSWORD, main_dir="src")
+        
+        # The kevinmcaleer/ota library requires a file name as the 5th argument.
+        # It's a positional argument, not a keyword argument.
+        ota = OTAUpdater(ota_url, config.WIFI_SSID, config.WIFI_PASSWORD, "main.py")
+        
         # Check for updates and download if available
         ota.download_and_install_update_if_available()
     except Exception as e:
@@ -161,19 +166,25 @@ async def publish_sensor_data(client):
     """Asynchronous task to read sensors and publish data."""
     global pulse_count
     last_publish_time = utime.time()
-    
+
     while True:
         try:
             current_time = utime.time()
             time_elapsed_seconds = current_time - last_publish_time
+            
+            # The RPM pulse counter is handled by the interrupt handler
+            # We only need to check for the publishing interval
             if time_elapsed_seconds >= config.UPDATE_FREQUENCY_SECONDS:
                 if time_elapsed_seconds > 0:
                     rpm = (pulse_count / pulses_per_revolution) / (time_elapsed_seconds / 60)
                 else:
                     rpm = 0
+                
                 temperature_celsius = thermocouple.read_temp()
+                
                 if isinstance(temperature_celsius, (int, float)):
                     temperature_celsius += config.THERMOCOUPLE_CALIBRATION
+                
                 if isinstance(temperature_celsius, (int, float)):
                     data_payload = {
                         "device": config.MQTT_DEVICE_NAME,
@@ -190,9 +201,12 @@ async def publish_sensor_data(client):
                         "error": temperature_celsius
                     }
                     client.publish(MQTT_TOPIC_DATA, json.dumps(error_payload))
+                
                 micropython.schedule(lambda: setattr(globals(), 'pulse_count', 0), None)
                 last_publish_time = current_time
+            
             await uasyncio.sleep_ms(100)
+            
         except OSError as e:
             print(f"MQTT publish error: {e}. Trying to reconnect...")
             board.switch_led(1, False)
@@ -244,6 +258,10 @@ async def main_async():
             await uasyncio.sleep(5)
 
 if __name__ == "__main__":
+    # Add a startup delay to allow time to interrupt the script
+    print("Starting in 5 seconds...")
+    time.sleep(5)
+    
     check_for_ota_update()
     try:
         uasyncio.run(main_async())
