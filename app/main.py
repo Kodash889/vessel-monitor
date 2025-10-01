@@ -144,24 +144,7 @@ def connect_mqtt():
         board.switch_led(1, False)
         return None
 
-# --- 4. OTA UPDATE CHECK ---
-def check_for_ota_update():
-    """Check for and apply an OTA update if available."""
-    print("Checking for OTA updates...")
-    try:
-        # Build the URL with the token
-        ota_url = "https://{0}@github.com/{1}/{2}".format(config.OTA_TOKEN, config.OTA_REPO_OWNER, config.OTA_REPO_NAME)
-        
-        # The kevinmcaleer/ota library requires a file name as the 5th argument.
-        # It's a positional argument, not a keyword argument.
-        ota = OTAUpdater(ota_url, config.WIFI_SSID, config.WIFI_PASSWORD, "main.py")
-        
-        # Check for updates and download if available
-        ota.download_and_install_update_if_available()
-    except Exception as e:
-        print(f"OTA update check failed: {e}")
-
-# --- 5. ASYNCHRONOUS TASKS ---
+# --- 4. ASYNCHRONOUS TASKS ---
 async def publish_sensor_data(client):
     """Asynchronous task to read sensors and publish data."""
     global pulse_count
@@ -233,14 +216,6 @@ async def publish_heartbeat(client):
 
 async def main_async():
     """Main asynchronous loop for the application."""
-    print("Starting Wi-Fi connection process...")
-    network_manager = NetworkManager(config.COUNTRY, status_handler=status_handler)
-    try:
-        await network_manager.client(config.WIFI_SSID, config.WIFI_PASSWORD)
-    except Exception as e:
-        print(f"Failed to start network manager: {e}")
-        return
-
     while True:
         mqtt_client = connect_mqtt()
         if mqtt_client:
@@ -261,8 +236,19 @@ if __name__ == "__main__":
     # Add a startup delay to allow time to interrupt the script
     print("Starting in 5 seconds...")
     time.sleep(5)
-    
+
+    # Move Wi-Fi connection logic to before the OTA check
+    print("Starting Wi-Fi connection process...")
+    network_manager = NetworkManager(config.COUNTRY, status_handler=status_handler)
+    try:
+        # Use a non-blocking way to connect to Wi-Fi before OTA check
+        uasyncio.run(network_manager.client(config.WIFI_SSID, config.WIFI_PASSWORD))
+    except Exception as e:
+        print(f"Failed to start network manager: {e}")
+        
     check_for_ota_update()
+
+    # Restart the main async loop after the OTA check is complete
     try:
         uasyncio.run(main_async())
     except KeyboardInterrupt:
