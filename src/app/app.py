@@ -407,7 +407,7 @@ async def run():
 def main(external_wdt=None):
     global wdt
     wdt = external_wdt if external_wdt is not None else WDT(timeout=8000)
-    print("App start. reset_cause =", _reset_cause_name(state.reset_cause))
+    print("App start (v1.1). reset_cause =", _reset_cause_name(state.reset_cause))
     # Exceptions propagate to the bootstrap (main.py), which handles rollback.
     uasyncio.run(run())
 

@@ -28,8 +28,8 @@ import network
 import config
 
 # --- configuration (safe getattr defaults so an old config.py still imports) ---
-REPO_OWNER     = getattr(config, "OTA_REPO_OWNER", "")
-REPO_NAME      = getattr(config, "OTA_REPO_NAME", "")
+REPO_OWNER     = getattr(config, "OTA_REPO_OWNER", "Kodash889")
+REPO_NAME      = getattr(config, "OTA_REPO_NAME", "vessel-monitor")
 BRANCH         = getattr(config, "OTA_BRANCH", "main")
 REMOTE_DIR     = getattr(config, "OTA_REMOTE_DIR", "src/app")  # path inside the repo
 TOKEN          = getattr(config, "OTA_TOKEN", None)            # None => public repo
