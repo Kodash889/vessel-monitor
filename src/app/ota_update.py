@@ -28,8 +28,8 @@ import network
 import config
 
 # --- configuration (safe getattr defaults so an old config.py still imports) ---
-REPO_OWNER     = getattr(config, "OTA_REPO_OWNER", "Kodash889")
-REPO_NAME      = getattr(config, "OTA_REPO_NAME", "vessel-monitor")
+REPO_OWNER     = getattr(config, "OTA_REPO_OWNER", "")
+REPO_NAME      = getattr(config, "OTA_REPO_NAME", "")
 BRANCH         = getattr(config, "OTA_BRANCH", "main")
 REMOTE_DIR     = getattr(config, "OTA_REMOTE_DIR", "src/app")  # path inside the repo
 TOKEN          = getattr(config, "OTA_TOKEN", None)            # None => public repo
@@ -100,7 +100,11 @@ def _fetch_text(remote_path, feed=None):
     if feed:
         feed()
     gc.collect()
-    r = requests.get(_url(remote_path), headers=_headers())
+    # Cache-bust: raw.githubusercontent is CDN-cached (~5 min). A unique query
+    # param forces a fresh fetch so a just-pushed version is seen immediately.
+    url = _url(remote_path)
+    url += ('&' if '?' in url else '?') + 'nocache=' + str(time.ticks_ms())
+    r = requests.get(url, headers=_headers())
     try:
         if r.status_code != 200:
             raise OSError("HTTP %d for %s" % (r.status_code, remote_path))
