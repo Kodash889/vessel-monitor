@@ -31,6 +31,7 @@ try:
 except Exception:
     ota_update = None
 import status_led
+import config_store
 
 # ----------------------------------------------------------------------------
 # Tunables (override any of these in config.py if you like)
@@ -58,6 +59,7 @@ THERMOCOUPLE_SO_PIN  = 2
 MQTT_CLIENT_ID    = b"pico_w_" + config.MQTT_DEVICE_NAME.encode("utf-8")
 MQTT_TOPIC_DATA   = config.MQTT_TOPIC_DATA.format(config.MQTT_DEVICE_NAME).encode("utf-8")
 MQTT_TOPIC_STATUS = config.MQTT_TOPIC_STATUS.format(config.MQTT_DEVICE_NAME).encode("utf-8")
+MQTT_TOPIC_CONFIG = getattr(config, "MQTT_TOPIC_CONFIG", "vessel/{}/config").format(config.MQTT_DEVICE_NAME).encode("utf-8")
 
 
 # ----------------------------------------------------------------------------
@@ -104,6 +106,7 @@ def _pulse_irq(pin):
 
 board = Automation2040WMini()
 status = status_led.StatusLED(board)   # visual-debugging indicator (conn LED)
+config_store.load()                    # apply any saved calibration overrides
 thermocouple = MAX6675(THERMOCOUPLE_SCK_PIN, THERMOCOUPLE_CS_PIN, THERMOCOUPLE_SO_PIN)
 
 rpm_pin = Pin(26, Pin.IN, Pin.PULL_DOWN)
@@ -183,6 +186,31 @@ async def connect_wifi():
 # ----------------------------------------------------------------------------
 # MQTT
 # ----------------------------------------------------------------------------
+_pending_health = False   # set by the config callback so the loop echoes promptly
+
+
+def _fw_version():
+    try:
+        with open("version.json") as f:
+            return json.load(f).get("version")
+    except Exception:
+        return None
+
+
+def _on_config_msg(topic, msg):
+    """MQTT callback: apply whitelisted calibration updates from the web UI."""
+    global _pending_health
+    try:
+        updates = json.loads(msg)
+    except Exception:
+        print("config: bad payload")
+        return
+    changed = config_store.apply(updates)
+    if changed:
+        print("config: applied", changed)
+        _pending_health = True   # echo the new active config on the next loop tick
+
+
 def _new_client():
     lwt = json.dumps({"status": "disconnected"}).encode("utf-8")
     c = MQTTClient(
@@ -191,6 +219,7 @@ def _new_client():
         keepalive=MQTT_KEEPALIVE,
     )
     c.set_last_will(MQTT_TOPIC_STATUS, lwt, retain=True)
+    c.set_callback(_on_config_msg)
     return c
 
 
@@ -206,6 +235,7 @@ def connect_mqtt():
         c.publish(MQTT_TOPIC_STATUS,
                   json.dumps({"status": "connected"}).encode("utf-8"),
                   retain=True)
+        c.subscribe(MQTT_TOPIC_CONFIG, qos=1)   # retained config delivered on subscribe
         print("MQTT: connected")
         board.switch_led(1, True)
         return c
@@ -227,11 +257,12 @@ def read_sensors(interval_s):
     pulse_count = 0
     machine.enable_irq(irq_state)
 
-    rpm = (pulses / PULSES_PER_REVOLUTION) / (interval_s / 60) if interval_s > 0 else 0.0
+    ppr = config_store.get('pulses_per_revolution') or 1
+    rpm = (pulses / ppr) / (interval_s / 60) if interval_s > 0 else 0.0
 
     temp = thermocouple.read_temp()
     if isinstance(temp, (int, float)):
-        temp += THERMOCOUPLE_CALIBRATION
+        temp += config_store.get('thermocouple_calibration') or 0.0
     return round(rpm, 2), temp
 
 
@@ -275,6 +306,9 @@ def publish_health():
         "queued": len(outbox),
         "reset_cause": _reset_cause_name(state.reset_cause),
         "last_error": state.last_error,
+        "fw_version": _fw_version(),
+        "thermocouple_calibration": config_store.get('thermocouple_calibration'),
+        "pulses_per_revolution": config_store.get('pulses_per_revolution'),
     }
     state.client.publish(MQTT_TOPIC_STATUS, json.dumps(health).encode("utf-8"))
 
@@ -340,6 +374,7 @@ def mark_link_down(where, e):
 
 async def run():
     uasyncio.create_task(status.run())   # visual-debugging LED task
+    global _pending_health
     await ensure_connected()
     confirmed = False
     healthy_deadline = utime.time() + HEALTHY_AFTER_S
@@ -371,20 +406,27 @@ async def run():
             last_sensor = now
             print("rpm=%s temp=%s queued=%d" % (rpm, temp, len(outbox)))
 
-        # 2) Periodic health heartbeat
-        if now - last_health >= HEARTBEAT_INTERVAL_SECONDS:
+        # 2) Periodic health heartbeat (or an immediate echo after a config change)
+        if _pending_health or now - last_health >= HEARTBEAT_INTERVAL_SECONDS:
             try:
                 publish_health()
                 last_health = now
+                _pending_health = False
             except OSError as e:
                 mark_link_down("health", e)
 
-        # 3) Active liveness probe: ping + consume PINGRESP
-        if now - last_check >= LINK_CHECK_SECONDS:
-            last_check = now
+        # 2b) Process inbound messages (retained config + UI calibration) promptly
+        if state.mqtt_ok and state.client is not None:
             try:
                 state.client.sock.setblocking(False)
-                state.client.check_msg()   # drains anything pending, non-blocking
+                state.client.check_msg()
+            except OSError as e:
+                mark_link_down("recv", e)
+
+        # 3) Active liveness probe: ping (keepalive)
+        if state.mqtt_ok and now - last_check >= LINK_CHECK_SECONDS:
+            last_check = now
+            try:
                 state.client.ping()
             except OSError as e:
                 mark_link_down("ping", e)
@@ -407,7 +449,7 @@ async def run():
 def main(external_wdt=None):
     global wdt
     wdt = external_wdt if external_wdt is not None else WDT(timeout=8000)
-    print("App start (v1.1). reset_cause =", _reset_cause_name(state.reset_cause))
+    print("App start. reset_cause =", _reset_cause_name(state.reset_cause))
     # Exceptions propagate to the bootstrap (main.py), which handles rollback.
     uasyncio.run(run())
 
